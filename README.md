@@ -8,24 +8,18 @@
 
 ## ⚠️ 两件事先说
 
-### 1. 这个版本没有在游戏里实测过
+### 1. 游戏实测结果
 
-代码结构完整、逻辑按**已验证的数据**写，**但「实际生效」这一步没做**。
+**已在游戏中实测，功能运行正常。**
 
-**装之前请先用日志确认**：
+- M-1000 Maxigun 背包加特林已替换为 E/MG-101 HMG Emplacement 射弹。
+- 已解锁开火时移动。
+
+如需检查 mod 加载状态，可查看日志：
 
 ```
 %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\MaxigunHMGRound-STATUS.txt
 ```
-
-成功应看到：
-
-```
-projectile swap : true
-fire while move : true
-```
-
-> 如果你跑通了，欢迎反馈 —— 这是目前最缺的一环。
 
 ### 2. 反作弊风险
 
