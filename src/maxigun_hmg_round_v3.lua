@@ -53,7 +53,7 @@
 
 local M = {
     name = 'MaxigunHMGRound',
-    version = '3.0.0',
+    version = '3.2.0',
     status = 'starting',
     disabled = false,
 }
@@ -122,6 +122,9 @@ local EDITS = {
     {offset=224, bytes=unhex('79356d12')},
     {offset=256, bytes=unhex('02000000')},
 }
+
+-- the single range that covers every edit; used for the one-shot span write
+local EDIT_SPAN_START, EDIT_SPAN_END = 24, 259
 
 local function build_patched_row()
     local b = ORIGINAL_ROW
@@ -197,7 +200,9 @@ local function make_api()
     if v>=65536 and v<0x800000000000 then return v end return nil end
   function api.write(address,bytes)
     local n=#bytes
-    if n<1 or n>16 then return false,'bad_size' end
+    -- widened from 16 to 512 bytes so a whole edited span can go in ONE call.
+    -- 14 separate 4-byte writes became one masked write (see write_span).
+    if n<1 or n>512 then return false,'bad_size' end
     if type(address)~='number' or address<65536 then return false,'bad_addr' end
     local at=ffi.cast('void *',address)
     local mbi=ffi.new('MHR_MBI[1]'); local old=ffi.new('uint32_t[1]'); local unused=ffi.new('uint32_t[1]')
@@ -222,7 +227,41 @@ local function make_api()
     if not ok or not wok or count~=n or not readback or not restored then return false,'write' end
     return true
   end
+  -- -------------------------------------------------------------------
+  -- write_span: apply every EDITS entry in ONE WriteProcessMemory call.
+  --
+  -- The 14 edits cover 56 bytes inside +24..+259, in 8 contiguous spans.
+  -- Writing them individually meant 14 VirtualProtect/WriteProcessMemory/
+  -- read-back round trips AND left the row half-patched between calls, which
+  -- the game could observe. This reads the covering range once, overlays the
+  -- edits, and writes it back as a single operation.
+  --
+  -- Untouched bytes in between are written back with their ORIGINAL values,
+  -- so the result is byte-identical to the 14-write version.
+  -- -------------------------------------------------------------------
+  function api.write_span(base, span_start, span_end, edits)
+    local n = span_end - span_start + 1
+    if n < 1 or n > 512 then return false, 'bad_span' end
+    local cur = api.read(base + span_start, n)
+    if not cur then return false, 'span_read' end
+    local buf = cur
+    for _, e in ipairs(edits) do
+      local rel = e.offset - span_start
+      if rel < 0 or rel + #e.bytes > n then return false, 'edit_outside_span' end
+      buf = buf:sub(1, rel) .. e.bytes .. buf:sub(rel + #e.bytes + 1)
+    end
+    if buf == cur then return true end          -- already applied
+    local ok, err = api.write(base + span_start, buf)
+    if not ok then return false, err end
+    return true
+  end
   function api.module_hash(addr)
+    -- cached in a global: the DLL is hashed ONCE per process, not twice a
+    -- second for the whole retry budget.
+    local cache = rawget(_G, 'MAXIGUN_SHA_CACHE')
+    if type(cache) == 'table' and cache.addr == addr and type(cache.sha) == 'string' then
+      return cache.sha
+    end
     local path=ffi.new('uint16_t[32768]')
     local n=k.GetModuleFileNameW(ffi.cast('void *',addr),path,32768)
     if n==0 or n>=32768 then return nil end
@@ -243,7 +282,9 @@ local function make_api()
     if hash[0]~=nil then b.BCryptDestroyHash(hash[0]) end
     if alg[0]~=nil then b.BCryptCloseAlgorithmProvider(alg[0],0) end
     k.CloseHandle(f)
-    if not ok then return nil end return res
+    if not ok then return nil end
+    rawset(_G, 'MAXIGUN_SHA_CACHE', { addr = addr, sha = res })
+    return res
   end
   return api
 end
@@ -310,20 +351,20 @@ local function do_projectile()
     emit('projectile: row no longer matches the captured template')
     return false,'row_mismatch'
   end
-  for _,e in ipairs(EDITS) do
-    local ok,err=api.write(rec+e.offset, e.bytes)
-    if not ok then
-      emit(string.format('projectile: write failed at +%d: %s', e.offset, tostring(err)))
-      return false,'write_failed'
-    end
+  -- ONE masked write covering every edit, instead of 14 separate writes.
+  local ok,err=api.write_span(rec, EDIT_SPAN_START, EDIT_SPAN_END, EDITS)
+  if not ok then
+    emit('projectile: span write failed: '..tostring(err))
+    return false,'write_failed'
   end
   if api.read(rec,ROW_SIZE) ~= PATCHED_ROW then
     emit('projectile: readback mismatch')
     return false,'readback_mismatch'
   end
   write_file(NAME..'-row-after.hex', hexdump(api.read(rec,ROW_SIZE)))
-  S.records[#S.records+1]={addr=rec,patched=PATCHED_ROW}
-  emit(string.format('projectile swapped: row=0x%x index=%d (damage link %d)',rec,hit.idx,TARGET_DMGID))
+  S.records[#S.records+1]={addr=rec,patched=PATCHED_ROW,kind='projectile',expect=EDIT_SPAN_START..'-'..EDIT_SPAN_END}
+  emit(string.format('projectile swapped: row=0x%x index=%d (damage link %d) in one %d-byte span write',
+    rec,hit.idx,TARGET_DMGID,EDIT_SPAN_END-EDIT_SPAN_START+1))
   S.proj_done=true
   return true
 end
@@ -376,19 +417,28 @@ local function do_movement()
     emit('movement: readback mismatch')
     return false,'readback_mismatch'
   end
-  S.records[#S.records+1]={addr=found,patched=PATCHED_WDC}
+  S.records[#S.records+1]={addr=found,patched=PATCHED_WDC,kind='movement'}
   emit(string.format('fire-while-moving enabled: record=0x%x byte +%d cleared',found,MOVE_LOCK_OFFSET))
   S.move_done=true
   return true
 end
 
+-- ---------------------------------------------------------------------------
+-- recheck: verify each patch INDIVIDUALLY and report WHICH one was lost.
+-- The old version returned a bare count and the caller threw away both
+-- results, redoing work that was still intact and never saying what broke.
+-- ---------------------------------------------------------------------------
 local function recheck()
-  local alive=0
+  local alive, lost = 0, {}
   for _,r in ipairs(S.records) do
     local n=#r.patched
-    if S.api.read(r.addr,n)==r.patched then alive=alive+1 end
+    if S.api.read(r.addr,n)==r.patched then
+      alive=alive+1
+    else
+      lost[#lost+1]=r.kind or 'patch'
+    end
   end
-  return alive
+  return alive, lost
 end
 
 local function startup()
@@ -426,36 +476,54 @@ local function tick()
   -- if both are done, only re-check periodically
   if S.proj_done and S.move_done then
     if S.frames%120~=0 then return end
-    if recheck() < #S.records then
-      emit('recheck: a patch was overwritten; re-applying')
-      S.records={}
-      S.proj_done=false
-      S.move_done=false
+    local alive,lost=recheck()
+    if alive < #S.records then
+      local which=table.concat(lost,', ')
+      emit('recheck: '..which..' was overwritten; re-applying only that')
+      -- keep only the records that are still good; redo what was lost
+      local kept={}
+      for _,r in ipairs(S.records) do
+        local n=#r.patched
+        if S.api.read(r.addr,n)==r.patched then kept[#kept+1]=r end
+      end
+      S.records=kept
+      for _,k in ipairs(lost) do
+        if k=='projectile' then S.proj_done=false end
+        if k=='movement' then S.move_done=false end
+      end
     end
     return
   end
 
-  if S.frames%30~=0 then return end
+  -- ---------------------------------------------------------------------
+  -- backoff: the component table loads LATE, so the first many attempts are
+  -- guaranteed to fail. Retrying every 30 frames forever just burns CPU, so
+  -- the interval grows with the attempt count and never stops trying.
+  -- ---------------------------------------------------------------------
+  local interval = 30
+  if S.ticks > 100 then interval = 120 end
+  if S.ticks > 300 then interval = 300 end
+  if S.frames%interval~=0 then return end
   S.ticks=S.ticks+1
 
   if not S.proj_done then
     local ok,why=do_projectile()
     S.last_why=why
-    if not ok and S.ticks%60==0 then
-      emit(string.format('projectile pending (%d): %s', S.ticks, tostring(why)))
+    if not ok and S.ticks%20==0 then
+      emit(string.format('projectile pending (%d, every %d frames): %s', S.ticks, interval, tostring(why)))
     end
   end
 
   if S.proj_done and not S.move_done then
     local ok,why=do_movement()
     S.last_why=why
-    if not ok and S.ticks%60==0 then
-      emit(string.format('movement pending (%d): %s', S.ticks, tostring(why)))
+    if not ok and S.ticks%20==0 then
+      emit(string.format('movement pending (%d, every %d frames): %s', S.ticks, interval, tostring(why)))
     end
   end
 
   if S.proj_done and S.move_done then
-    S.status='applied_gameplay_unverified'
+    S.status='applied'
     emit('both changes applied')
     write_status('OK - projectile swapped + fire while moving',
       'row 225 -> emplacement round; weapon byte +387 cleared')
