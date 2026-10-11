@@ -15,8 +15,8 @@ To check the loader, open `BingusSharedLoader.log`. Its first line should read `
 ## Install
 
 1. Exit the game completely; returning to the main menu is not enough.
-2. Disable `starm/minigun_backpack_heavy_mobile` and other Maxigun mods. The reference mod also changes damage profile 127 and armor penetration.
-3. Import `Maxigun-HMG-Mobile-v3.2.zip` into the loader.
+2. v3.5.0 has been tested alongside HD2 HUD+ with both mods active. Other mods that edit the same weapon data have not all been tested. If the mod reports a lookup or identity error, disable other Maxigun or weapon-data mods and retry.
+3. Import `Maxigun-HMG-Mobile-v3.5.zip` into the loader.
 4. Click **Deploy**, then launch the game. The changes apply automatically after startup.
 
 ## Verify in a mission
@@ -41,7 +41,7 @@ projectile swap : true
 fire while move : true
 ```
 
-Both values must be `true`. The log should also report `game_dll_hash_verified`, the projectile row (index 225, damage link 127), and the movement flag cleared at byte `+387`.
+Both values must be `true`. The log should also report `game_dll_hash_verified`, the projectile row (index 225, damage link 127), and the movement flag cleared at byte `+387`. For modified weapon records, v3.5.0 logs `weapon record located with N% match ... locked_confirmed`; this tolerant lookup path was confirmed in game at 99.9% similarity, including with HD2 HUD+ active.
 
 Before/after row dumps are available as `MaxigunHMGRound-row-before.hex` and `MaxigunHMGRound-row-after.hex`. Key expected changes are caliber `8.0 → 12.5` at `+48`, velocity `920 → 880` at `+56`, mass `11 → 52` at `+60`, and damage link `127 → 204` at `+84`.
 
@@ -58,11 +58,12 @@ The report files are `MaxigunProbeRO-STATUS.txt`, `MaxigunProbeRO-changes.txt`, 
 
 ## Troubleshooting
 
-- **`waiting` or `locate`:** The component table loads late. The mod retries with backoff (30, 120, then 300 frames); entering a mission usually allows it to initialize.
+- **`waiting` or `locate`:** The component table loads late. The mod retries with backoff; entering a mission usually allows it to initialize.
 - **`game_dll_hash_mismatch`:** The game build changed and the mod refused to run. Wait for an updated build.
 - **`row_mismatch`:** The projectile row differs from the captured template, possibly because the game changed or another mod edited it. Disable conflicting Maxigun mods and restart.
 - **`damage_link_ambiguous`:** More than one row matched damage link 127. The mod refuses to write rather than guessing; the locator must be rechecked for the new game build.
-- **No visible effect:** Confirm the two `true` values in the status file, disable conflicting mods, and make sure you brought the M-1000 Maxigun backpack (not the A/G-16 Gatling Sentry).
+- **`weapon_record_not_found` or `identity_unconfirmed`:** The candidate record was missing or failed the identity check. Disable other mods that modify weapon data and retry. The locator refuses low-confidence matches rather than guessing.
+- **No visible effect:** Confirm the two `true` values in the status file, check for other mods modifying the same data, and make sure you brought the M-1000 Maxigun backpack (not the A/G-16 Gatling Sentry).
 
 ## Uninstall
 

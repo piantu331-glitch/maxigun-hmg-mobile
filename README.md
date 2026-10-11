@@ -4,7 +4,7 @@ A **Lua injection mod** for Helldivers 2, running through [Bingus Shared Loader]
 
 **This mod replaces the M-1000 Maxigun backpack's projectile with the E/MG-101 HMG Emplacement projectile and enables firing while moving.**
 
-> **Status:** Projectile replacement and fire-while-moving were verified in game in v3.2.0. The v3.5.0 tolerant weapon-record locator passes 11/11 offline simulation scenarios; **the v3.5.0 locator still needs in-game testing**.
+> **Status:** v3.5.0 projectile replacement, fire-while-moving, tolerant record lookup, and simultaneous use with HD2 HUD+ have been tested in game. The locator reported a **99.9% template match** with `locked_confirmed`; its offline simulation passes 11/11 scenarios.
 
 One mod · one projectile replacement · one byte cleared to enable movement.
 
@@ -98,6 +98,8 @@ The v3.5.0 locator:
 
 Candidates below an 80% similarity score are rejected. Scanning covers the containing memory allocation plus `hm ±8 MB`, capped at 32 MB. After 300 retries, the interval increases to 900 frames to limit repeated large scans. The component table loads late, so retries are expected.
 
+In the v3.5.0 in-game run, the record differed from the original capture by one or two bytes. The locator found it at 99.9% similarity, confirmed it as `locked_confirmed`, and both changes applied. Simultaneous operation with HD2 HUD+ was also confirmed in game. Compatibility with other mods that edit the same data has not been verified individually.
+
 ### Fire while moving
 
 The mod clears one byte in `Minigun.WeaponDataComponent`:
@@ -118,12 +120,12 @@ The containing dword changes from `0x01010001` to `0x00010001`.
 
 ### Check for conflicts
 
-Disable `starm/minigun_backpack_heavy_mobile` before installing this mod. It also changes damage profile 127 and armor penetration, so the two mods conflict. Disable other Maxigun mods as well.
+v3.5.0 has been tested alongside HD2 HUD+ with both mods active. Other mods that edit the same weapon data have not all been tested. If the mod reports a lookup or identity error, disable other Maxigun or weapon-data mods and retry. Older v3.0–v3.4 versions require an exact weapon-record match and can fail when another mod changes that record.
 
 ### Steps
 
 1. Exit the game completely; ending the process is required, not just returning to the main menu.
-2. Import `dist/Maxigun-HMG-Mobile-v3.2.zip` into Bingus Shared Loader.
+2. Import `dist/Maxigun-HMG-Mobile-v3.5.zip` into Bingus Shared Loader.
 3. Click **Deploy**, then start the game.
 4. Enter a mission and bring the Maxigun backpack.
 
@@ -161,9 +163,12 @@ Both values marked `true` are key.
 ```text
 game_dll_hash_verified
 projectile swapped: row=0x... index=225 (damage link 127) in one 236-byte span write
+weapon record located with 99.9% match to the original capture (0x..., locked_confirmed)
 fire-while-moving enabled: record=0x... byte +387 cleared
 both changes applied
 ```
+
+The `weapon record located with N% match` line appears when the record differs from the original capture. `locked_confirmed` means the independent identity check at `+384` passed.
 
 ### Verify the captured bytes
 
@@ -218,7 +223,7 @@ To use it, disable the main mod, install the probe by itself, launch a mission w
 | 3.0.0 | Projectile replacement and fire while moving |
 | 3.1.0 | Engineering improvements: cached hash, single-span write, targeted recheck, and backoff retries |
 | **3.2.0** | **In-game verified**; status changed from `applied_gameplay_unverified` to `applied` |
-| **3.5.0** | Tolerant weapon-record lookup to coexist with mods such as HD2 HUD+; 11/11 offline scenarios pass; in-game verification pending |
+| **3.5.0** | Tolerant weapon-record lookup; 11/11 offline scenarios pass; in-game test confirmed a 99.9% match and simultaneous use with HD2 HUD+ |
 
 The four v3.1.0 optimizations were checked byte for byte to confirm behavior did not change:
 
@@ -226,7 +231,7 @@ The four v3.1.0 optimizations were checked byte for byte to confirm behavior did
 PASS — the one-shot span write is byte-identical to the 14-write version
 ```
 
-The v3.5.0 locator's offline simulations cover modified records, an already-cleared movement byte, decoy signature matches, unconfirmed identities, and records with too many changed bytes. See the [v3.5.0 update notes](docs/release-notes-v3.5.0.md) for the full change summary and current verification status.
+The v3.5.0 locator's offline simulations cover modified records, an already-cleared movement byte, decoy signature matches, unconfirmed identities, and records with too many changed bytes. In-game testing also confirmed the modified-record path and simultaneous use with HD2 HUD+. See the [v3.5.0 update notes](docs/release-notes-v3.5.0.md) for details.
 
 ## Repository layout
 

@@ -20,15 +20,16 @@ Scanning covers the containing allocation plus `hm ±8 MB`, up to 32 MB. After 3
 ## Verification status
 
 - Offline locator simulation: **11 passed, 0 failed**.
-- In-game testing of the v3.5.0 locator: **pending**.
-- Projectile replacement and fire-while-moving were verified in game in v3.2.0; v3.5.0 changes the weapon-record lookup for the movement unlock.
+- In-game testing: **passed**. The modified weapon record was located with a 99.9% match and `locked_confirmed`; both mod changes applied.
+- Simultaneous use with HD2 HUD+: **confirmed in game**; both mods were active and working.
+- Records modified by 50% or more: designed to reject writing; this case has not been tested in game.
 
 ## Compatibility and installation
 
 - Requires Bingus Shared Loader v15 or later with addon support enabled.
 - Game build targeted by the package: 25480438 / executable 1.8.46015.0.
 - The mod checks the `game.dll` SHA-256 and refuses to run if the binary differs.
-- Disable other mods that modify the same weapon data if issues occur. v3.5.0's tolerant lookup was designed to coexist with HD2 HUD+, but that compatibility still needs in-game confirmation.
+- v3.5.0's tolerant lookup was designed for mods that edit the same weapon record. Coexistence with HD2 HUD+ was confirmed in game; other weapon-data mods have not all been tested individually.
 - Import `Maxigun-HMG-Mobile-v3.5.zip`, click **Deploy**, then start the game.
 
 See the [README](../README.md) and [installation guide](installation-guide.md) for details.
