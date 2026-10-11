@@ -33,7 +33,7 @@ Logs are stored in `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`.
 
 ```text
 OK - projectile swapped + fire while moving
-mod     : MaxigunHMGRound v3.2.0
+mod     : MaxigunHMGRound v3.5.0
 build   : 25480438 / exe 1.8.46015.0
 status  : applied
 records : 2

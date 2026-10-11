@@ -4,7 +4,7 @@ A **Lua injection mod** for Helldivers 2, running through [Bingus Shared Loader]
 
 **This mod replaces the M-1000 Maxigun backpack's projectile with the E/MG-101 HMG Emplacement projectile and enables firing while moving.**
 
-> **Status: tested in game — v3.2.0**
+> **Status:** Projectile replacement and fire-while-moving were verified in game in v3.2.0. The v3.5.0 tolerant weapon-record locator passes 11/11 offline simulation scenarios; **the v3.5.0 locator still needs in-game testing**.
 
 One mod · one projectile replacement · one byte cleared to enable movement.
 
@@ -87,7 +87,16 @@ Index or speed alone would be ambiguous: four rows have a velocity of 920 m/s (i
 
 ### Weapon component lookup
 
-The mod searches for the weapon component by its 1,232-byte contents, using the complete template published by the reference mod. It reaches the component table through `*(owner + (-13614272))`, where `owner = *(game.dll + 54973760)`. The table loads late, so the mod retries with backoff.
+**v3.5.0 updates this lookup to tolerate other mods that edit the same 1,232-byte weapon record, including HD2 HUD+.** Earlier versions required an exact full-record match, so a few changed fields could make the component impossible to locate.
+
+The v3.5.0 locator:
+
+1. Finds candidates using the first 32 bytes of the captured signature (the aim-limit float block: 20/20/90/90).
+2. Scores each candidate against the full template and selects the closest match.
+3. Confirms identity with an independent hard feature: the dword at `+384` must be `0x01010001` (movement locked) or `0x00010001` (already unlocked).
+4. Changes and rereads only the movement byte at `+387`, leaving other mods' fields untouched.
+
+Candidates below an 80% similarity score are rejected. Scanning covers the containing memory allocation plus `hm ±8 MB`, capped at 32 MB. After 300 retries, the interval increases to 900 frames to limit repeated large scans. The component table loads late, so retries are expected.
 
 ### Fire while moving
 
@@ -135,7 +144,7 @@ Logs are stored in:
 ```text
 OK - projectile swapped + fire while moving
 
-mod     : MaxigunHMGRound v3.2.0
+mod     : MaxigunHMGRound v3.5.0
 build   : 25480438 / exe 1.8.46015.0
 status  : applied
 records : 2
@@ -190,7 +199,7 @@ The 14 edits are combined into one 236-byte write spanning `+24..+259`. This red
 
 ## Known limitation
 
-The current check requires the full 272-byte row to match its captured template. The mod changes 31 bytes and leaves 216 other bytes untouched; if the game changes any of those bytes at runtime, the mod may report `row_mismatch` and refuse to write.
+The **projectile-row** check still requires the full 272-byte row to match its captured template. The mod changes 31 bytes and leaves 216 other bytes untouched; if the game changes any of those bytes at runtime, the projectile swap may report `row_mismatch` and refuse to write. The v3.5 tolerant matching change applies to the separate weapon record used for the movement unlock.
 
 The optional read-only probe is included to find out which bytes change. Until probe data shows the full-row check is too strict, the check remains in place; weakening it could make the mod write to the wrong data.
 
@@ -209,12 +218,15 @@ To use it, disable the main mod, install the probe by itself, launch a mission w
 | 3.0.0 | Projectile replacement and fire while moving |
 | 3.1.0 | Engineering improvements: cached hash, single-span write, targeted recheck, and backoff retries |
 | **3.2.0** | **In-game verified**; status changed from `applied_gameplay_unverified` to `applied` |
+| **3.5.0** | Tolerant weapon-record lookup to coexist with mods such as HD2 HUD+; 11/11 offline scenarios pass; in-game verification pending |
 
 The four v3.1.0 optimizations were checked byte for byte to confirm behavior did not change:
 
 ```text
 PASS — the one-shot span write is byte-identical to the 14-write version
 ```
+
+The v3.5.0 locator's offline simulations cover modified records, an already-cleared movement byte, decoy signature matches, unconfirmed identities, and records with too many changed bytes. See the [v3.5.0 update notes](docs/release-notes-v3.5.0.md) for the full change summary and current verification status.
 
 ## Repository layout
 

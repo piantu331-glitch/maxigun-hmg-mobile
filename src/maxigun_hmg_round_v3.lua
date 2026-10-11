@@ -53,7 +53,7 @@
 
 local M = {
     name = 'MaxigunHMGRound',
-    version = '3.2.0',
+    version = '3.5.0',
     status = 'starting',
     disabled = false,
 }
@@ -144,7 +144,7 @@ local PATCHED_WDC = build_patched_wdc()
 
 local S = { log={}, disabled=false, frames=0, tries=0, api=nil, owner=nil,
             phase='init', records={}, max_tries=1200, last_why=nil, ticks=0,
-            proj_done=false, move_done=false }
+            proj_done=false, move_done=false, scanned_bytes=0 }
 
 local function base_dir() local l=os.getenv('LOCALAPPDATA') or '.' return l..'\\CowboyBingus\\Helldivers2\\Logs' end
 local function write_file(n,c) local f=io.open(base_dir()..'\\'..n,'wb') if not f then return false end f:write(c) f:close() return true end
@@ -190,7 +190,8 @@ local function make_api()
   local api={}
   function api.module(n) local p=k.GetModuleHandleA(n) if p~=nil then return tonumber(ffi.cast('uintptr_t',p)) end end
   function api.read(a,sz)
-    if type(a)~='number' or a<65536 or a+sz>=0x800000000000 or sz<=0 or sz>8192 then return nil end
+    -- raised from 8192 so the component entry array can be read in one call
+    if type(a)~='number' or a<65536 or a+sz>=0x800000000000 or sz<=0 or sz>262144 then return nil end
     local out=ffi.new('uint8_t[?]',sz); local got=ffi.new('size_t[1]')
     if k.ReadProcessMemory(process,ffi.cast('const void *',a),out,sz,got)==0 or tonumber(got[0])~=sz then return nil end
     return ffi.string(out,sz)
@@ -198,6 +199,149 @@ local function make_api()
   function api.pointer(s) if not s or #s<8 then return nil end
     local v=0 for i=8,1,-1 do v=v*256+s:byte(i) end
     if v>=65536 and v<0x800000000000 then return v end return nil end
+  -- the base of the allocation containing `a`, straight from VirtualQuery
+  function api.region_base(a)
+    if type(a)~='number' or a<65536 then return nil end
+    local mbi=ffi.new('MHR_MBI[1]')
+    if tonumber(k.VirtualQuery(ffi.cast('void *',a),mbi,ffi.sizeof(mbi[0])))~=ffi.sizeof(mbi[0]) then return nil end
+    local b=tonumber(ffi.cast('uintptr_t',mbi[0].BaseAddress))
+    if b and b>=65536 and b<0x800000000000 then return b end
+  end
+  -- base AND size of that allocation
+  function api.region_info(a)
+    if type(a)~='number' or a<65536 then return nil end
+    local mbi=ffi.new('MHR_MBI[1]')
+    if tonumber(k.VirtualQuery(ffi.cast('void *',a),mbi,ffi.sizeof(mbi[0])))~=ffi.sizeof(mbi[0]) then return nil end
+    local b=tonumber(ffi.cast('uintptr_t',mbi[0].BaseAddress))
+    local s=tonumber(mbi[0].RegionSize)
+    if not b or b<65536 or b>=0x800000000000 then return nil end
+    if not s or s<=0 then return nil end
+    return b,s
+  end
+  -- -------------------------------------------------------------------
+  -- find_record: robust, TOLERANT location of the weapon record.
+  --
+  -- WHY TOLERANT
+  --   Other mods operate on the very same weapon-data records. HD2 HUD+ in
+  --   particular carries its own signature table naming
+  --   weapon_data_registry_size = 1232, weapon_data_records,
+  --   weapon_data_record_stride and a weapon_data_mode_write site -- i.e. it
+  --   reads and writes the same 1232-byte records this mod targets.
+  --
+  --   Requiring all 1232 bytes to equal the pristine capture therefore fails
+  --   as soon as any such mod touches a field, which is exactly what we saw:
+  --   with HD2 HUD+ on, weapon_record_not_found forever; with it off, instant
+  --   success.
+  --
+  -- HOW IT WORKS NOW
+  --   1. search a generous range for a distinctive 32-byte signature taken
+  --      from the record's opening float block
+  --   2. score every hit against the full capture and keep the BEST match -- a
+  --      few changed fields only dent the score, so the right record still wins
+  --   3. confirm identity with a mod-independent check: the movement-lock
+  --      dword at +384 must be 0x01010001 (locked) or 0x00010001 (already
+  --      cleared). Nothing else in a weapon record has that shape here.
+  --   4. write only the one byte, then verify only that one byte
+  --
+  -- Returns: found_addr, already_clear_addr, best_ratio, why
+  -- -------------------------------------------------------------------
+  function api.find_record(region,regsize,hm)
+    local tlen=#WDC_TEMPLATE
+    local function rd32(s,at)
+      if not s or #s<at+4 then return nil end
+      local a,b,c,d=s:byte(at+1,at+4)
+      return a+b*256+c*65536+d*16777216
+    end
+    -- range: the allocation (with margin) UNION the classic +/-8 MB window
+    -- around hm, capped so a pathological range cannot stall the game
+    local MARGIN=4*1024*1024
+    local from=region-MARGIN
+    if hm-8*1024*1024<from then from=hm-8*1024*1024 end
+    if from<0x10000 then from=0x10000 end
+    local to=region+regsize+MARGIN
+    if hm+8*1024*1024>to then to=hm+8*1024*1024 end
+    local CAP=32*1024*1024
+    local scanned=0
+    if to-from>CAP then to=from+CAP end
+
+    local SIG_STRONG=WDC_TEMPLATE:sub(1,32)   -- aim-limit float block
+    local SIG_WEAK  =WDC_TEMPLATE:sub(1,8)    -- fallback, looser
+
+    local best,bestRatio,bestFlag=nil,0,nil
+    local exact=nil
+    local seen={}
+
+    local function consider(addr)
+      local blk=api.read(addr,tlen)
+      if not blk then return end
+      local same=0
+      for i=1,tlen do if blk:byte(i)==WDC_TEMPLATE:byte(i) then same=same+1 end end
+      local ratio=same/tlen
+      if ratio>=0.9999 then exact=addr return end
+      local flag=rd32(blk,384)
+      local locked=(flag==0x01010001)
+      local clear =(flag==0x00010001)
+      -- prefer a record that passes the identity check, then the best ratio
+      local strong = locked or clear
+      if best==nil
+         or (strong and not bestFlag)
+         or (strong==(bestFlag~=nil) and ratio>bestRatio) then
+        best=addr bestRatio=ratio bestFlag= strong and flag or nil
+      end
+    end
+
+    local function scan_for(sig)
+      local pos=from
+      local carry,carryAddr='',0
+      local keep=#sig-1
+      while pos<to do
+        local chunk=api.read(pos,65536)
+        if not chunk then
+          local nb=api.region_info(pos+4096)
+          if nb and nb>pos then pos=nb else pos=pos+4096 end
+          carry,carryAddr='',0
+        else
+          scanned=scanned+#chunk
+          local hay=carry..chunk
+          local base=carryAddr
+          if base==0 then base=pos end
+          local cur=1
+          while true do
+            local at=hay:find(sig,cur,true)
+            if not at then break end
+            local addr=base+(at-1)
+            if not seen[addr] then seen[addr]=true consider(addr) end
+            if exact then return true end
+            cur=at+1
+          end
+          if #hay>keep then
+            carry=hay:sub(#hay-keep+1) carryAddr=base+#hay-keep
+          else
+            carry=hay carryAddr=base
+          end
+          pos=pos+#chunk
+        end
+      end
+      return false
+    end
+
+    if scan_for(SIG_STRONG) then return exact,nil,1,'exact' end
+    if not best then scan_for(SIG_WEAK) end
+    if exact then return exact,nil,1,'exact' end
+
+    S.scanned_bytes=scanned
+    if not best then return nil,nil,0,'no_signature_hit' end
+
+    if bestFlag==0x00010001 then
+      return nil,best,bestRatio,'already_clear'
+    end
+    if bestFlag==0x01010001 and bestRatio>=0.80 then
+      return best,nil,bestRatio,'locked_confirmed'
+    end
+    -- matched the signature but identity is unconfirmed -- refuse rather than
+    -- risk writing a byte in whatever else happened to match
+    return nil,nil,bestRatio,'identity_unconfirmed'
+  end
   function api.write(address,bytes)
     local n=#bytes
     -- widened from 16 to 512 bytes so a whole edited span can go in ONE call.
@@ -376,35 +520,58 @@ local function do_movement()
   local owner=api.pointer(api.read(game+OWNER_RVA,8))
   if not owner then return false,'owner_unreadable' end
 
-  -- reach the component table, then find the weapon record by CONTENT
+  -- -------------------------------------------------------------------
+  -- LOCATE THE WEAPON RECORD: TOLERANT CONTENT MATCH
+  --
+  -- HISTORY, because this was wrong several times:
+  --
+  --   v3.0-3.2 scanned a FIXED 16 MB window around hm and demanded the whole
+  --     1232 bytes equal the pristine capture. It broke the moment any other
+  --     mod touched a field -- and HD2 HUD+ does exactly that (its own
+  --     signature table names weapon_data_registry_size = 1232,
+  --     weapon_data_records and a weapon_data_mode_write site).
+  --
+  --   v3.3 used "region + index * 1232", which was CIRCULAR: the probe built
+  --     those addresses with base + index*1232 and I then "recovered" 1232
+  --     from them. The stride was never measured.
+  --
+  --   v3.4 scanned the whole allocation but still demanded an exact match, so
+  --     it inherited the same brittleness.
+  --
+  -- v3.5 scores every signature hit for overall similarity, keeps the BEST
+  -- match, and confirms identity with a mod-independent check: the
+  -- movement-lock dword at +384 must be 0x01010001 or 0x00010001. It then
+  -- writes one byte and verifies one byte. Fields other mods own are left
+  -- alone and no longer break location.
+  -- -------------------------------------------------------------------
   local hm=api.pointer(api.read(owner+WDC_SLOT,8))
   if not hm then return false,'component_table_unavailable' end
   if hm < 0x10000000000 or hm > 0x7f0000000000 then return false,'component_table_implausible' end
 
-  local from=hm-8*1024*1024
-  local span=16*1024*1024
-  local off,carry,cb=0,'',from
-  local found=nil
-  while off<span and not found do
-    local n=math.min(8192,span-off)
-    local raw=api.read(from+off,n)
-    if raw then
-      local hay=carry..raw; local cur=1
-      while true do
-        local at=hay:find(WDC_TEMPLATE,cur,true)
-        if not at then break end
-        found=cb+(at-1); cur=at+1; break
-      end
-      carry=hay:sub(-(#WDC_TEMPLATE-1)); cb=from+off+#raw-(#WDC_TEMPLATE-1)
-    else carry='' cb=from+off+n end
-    off=off+n
+  local region,regsize=api.region_info(hm)
+  if not region or not regsize then return false,'region_unresolved' end
+
+  local found,already_clear,ratio,why=api.find_record(region,regsize,hm)
+  if not found and not already_clear then
+    return false,string.format('weapon_record_not_found (scanned %.1f MB, best %.1f%%, %s)',
+      (S.scanned_bytes or 0)/1048576, (ratio or 0)*100, tostring(why))
   end
-  if not found then return false,'weapon_record_not_found' end
+  if not found and already_clear then
+    emit(string.format('movement lock already clear at 0x%x (another mod did it; match %.1f%%)',already_clear,(ratio or 0)*100))
+    S.records[#S.records+1]={addr=already_clear+MOVE_LOCK_OFFSET,patched='\0',kind='movement'}
+    S.move_done=true
+    return true
+  end
+  if ratio and ratio<0.9999 then
+    emit(string.format('weapon record located with %.1f%% match to the original capture (0x%x, %s)',
+      ratio*100,found,why))
+  end
 
   -- clear the movement lock: one byte
   local before=api.read(found+MOVE_LOCK_OFFSET,1)
   if before=='\0' then
     emit('movement lock already clear')
+    S.records[#S.records+1]={addr=found+MOVE_LOCK_OFFSET,patched='\0',kind='movement'}
     S.move_done=true
     return true
   end
@@ -413,11 +580,13 @@ local function do_movement()
     emit('movement: write failed: '..tostring(err))
     return false,'write_failed'
   end
-  if api.read(found, WDC_SIZE) ~= PATCHED_WDC then
-    emit('movement: readback mismatch')
+  -- verify ONLY the byte we changed. Requiring the whole record to equal
+  -- PATCHED_WDC would fail whenever another mod legitimately owns other fields.
+  if api.read(found+MOVE_LOCK_OFFSET,1) ~= '\0' then
+    emit('movement: readback mismatch at +'..MOVE_LOCK_OFFSET)
     return false,'readback_mismatch'
   end
-  S.records[#S.records+1]={addr=found,patched=PATCHED_WDC,kind='movement'}
+  S.records[#S.records+1]={addr=found+MOVE_LOCK_OFFSET,patched='\0',kind='movement'}
   emit(string.format('fire-while-moving enabled: record=0x%x byte +%d cleared',found,MOVE_LOCK_OFFSET))
   S.move_done=true
   return true
@@ -503,6 +672,9 @@ local function tick()
   local interval = 30
   if S.ticks > 100 then interval = 120 end
   if S.ticks > 300 then interval = 300 end
+  -- the movement step now scans up to 32 MB per attempt, so once the easy
+  -- attempts are exhausted, back off harder rather than rescanning every 5 s
+  if S.ticks > 300 and S.proj_done and not S.move_done then interval = 900 end
   if S.frames%interval~=0 then return end
   S.ticks=S.ticks+1
 
@@ -522,11 +694,30 @@ local function tick()
     end
   end
 
+  -- ---------------------------------------------------------------------
+  -- PARTIAL-STATUS REPORTING
+  -- The old code only wrote a status at startup and on full completion, so a
+  -- run where the projectile swap succeeded but the movement byte did not
+  -- reported "WORKING / waiting" with both flags false -- as if nothing had
+  -- happened. Now every change in the set of completed halves is written out,
+  -- including the half-done case, which is the one that actually occurs.
+  -- ---------------------------------------------------------------------
+  local done_key = tostring(S.proj_done) .. '/' .. tostring(S.move_done)
+  if done_key ~= S.last_status_key then
+    S.last_status_key = done_key
+    if S.proj_done and not S.move_done then
+      write_status('PARTIAL - projectile swapped, fire-while-moving not yet applied',
+        'projectile swap : true' .. '\n' ..
+        'fire while move : false  (last: ' .. tostring(S.last_why) .. ')')
+    elseif S.proj_done and S.move_done then
+      write_status('OK - projectile swapped + fire while moving',
+        'row 225 -> emplacement round; weapon byte +387 cleared')
+    end
+  end
+
   if S.proj_done and S.move_done then
     S.status='applied'
     emit('both changes applied')
-    write_status('OK - projectile swapped + fire while moving',
-      'row 225 -> emplacement round; weapon byte +387 cleared')
     return
   end
 
@@ -534,7 +725,10 @@ local function tick()
     S.disabled=true
     S.status='gave_up'
     emit('gave up')
-    write_status('FAILED - one or both changes not applied', tostring(S.last_why))
+    write_status('FAILED - one or both changes not applied',
+      'projectile swap : ' .. tostring(S.proj_done) ..
+      '\nfire while move : ' .. tostring(S.move_done) ..
+      '\nlast why        : ' .. tostring(S.last_why))
   end
 end
 
